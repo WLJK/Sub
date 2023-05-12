@@ -14,6 +14,10 @@
 /* IDL_TypeSupport.h中包含所有依赖的头文件 */
 #include "IDL_TypeSupport.h"
 
+std::condition_variable reply_received_condition;
+std::mutex reply_mutex;
+
+
 std::atomic<int> throughput_counter(0);
 std::mutex counter_mutex;
 static int data_size = 1024;
@@ -21,9 +25,9 @@ static long sent_packets = 0;  // 发送的数据包数量
 static long received_packets = 0;// 接收到的数据包数量
 static long before_sent = 0;    // 上次计算丢包发送数量
 
-std::queue<UserDataType> data_queue;  // 数据队列
-std::mutex queue_mutex;  // 互斥锁，用于保护数据队列的访问
-std::condition_variable queue_condition;  // 条件变量，用于线程间的通信
+//std::queue<UserDataType> data_queue;  // 数据队列
+//std::mutex queue_mutex;  // 互斥锁，用于保护数据队列的访问
+//std::condition_variable queue_condition;  // 条件变量，用于线程间的通信
 //使用OpenSSL库计算MD5哈希
     static std::string calculate_MD5(const std::string &input) {
     unsigned char hash[MD5_DIGEST_LENGTH];
@@ -36,48 +40,6 @@ std::condition_variable queue_condition;  // 条件变量，用于线程间的�
     return ss.str();
 }
 
-/*
-void dataProcessingThread()
-{
-    while (true)
-    {
-        UserDataType data_read;
-
-        {
-            std::unique_lock<std::mutex> lock(queue_mutex);
-            // 等待数据队列非空
-            queue_condition.wait(lock, [] { return !data_queue.empty(); });
-
-            // 从队列中取出数据
-            data_read = data_queue.front();
-            data_queue.pop();
-        }
-
-        // 获取从发送端接收到的数据和MD5
-        char* data = data_read.a;
-        char* received_MD5 = data_read.MD5;
-        long received_sent_packets = data_read.sent_packets; // 接收到的计数器值
-
-        //std::cout <<data<<std::endl;
-        // 计算接收到的数据的MD5哈希
-        std::string calculated_MD5 = calculate_MD5(std::string(data, data_size));
-
-        // 将接收到的MD5转换为字符串，以便比较
-        std::string received_MD5_str(received_MD5);
-
-        // 比较接收到的MD5哈希和计算得到的MD5哈希
-        if (calculated_MD5 != received_MD5_str) {
-            std::cerr << "MD5 不一致 " << received_MD5_str
-                      << ", calculated " << calculated_MD5 << std::endl;
-        }
-
-        std::lock_guard<std::mutex> lock(counter_mutex);
-        ++received_packets; // 接收到的数据包数量
-        sent_packets = received_sent_packets; // 更新发送的数据包数量
-        ++throughput_counter;
-    }
-}
-*/
 /* UserDataTypeListener继承于DataReaderListener，
    需要重写其继承过来的方法on_data_available()，在其中进行数据监听读取操作 */
 class UserDataTypeListener : public DataReaderListener {
@@ -114,26 +76,16 @@ void UserDataTypeListener::on_data_available(DataReader* reader)
 		return;
 	}
 
-	/* 打印数据 */
-	/* 建议1：避免在此进行复杂数据处理 */
-	/* 建议2：将数据传送到其他数据处理线程中进行处理 *
-	/* 建议3：假如数据结构中有string类型，用完后需手动释放 */
-
-
     for (i = 0; i < data_seq.length(); ++i) {
         //auto task = std::make_shared<ReadDataTask>(data_seq[i]);
         //UserDataType* data_read = new UserDataType(data_seq[i]);
         //pool->append(new ReadDataTask(data_read));
-
-        // 打印数据
-        //UserDataTypeTypeSupport::print_data(&data_seq[i]);
 
         // 获取从发送端接收到的数据和MD5
         char* data = data_seq[i].a;
         char* received_MD5 = data_seq[i].MD5;
         long received_sent_packets = data_seq[i].sent_packets; // 接收到的计数器值
 
-        //std::cout <<data<<std::endl;
         // 计算接收到的数据的MD5哈希
         std::string calculated_MD5 = calculate_MD5(std::string(data, data_size));
 
@@ -146,15 +98,21 @@ void UserDataTypeListener::on_data_available(DataReader* reader)
                       << ", calculated " << calculated_MD5 << std::endl;
         }
 
-        //std::lock_guard<std::mutex> lock(counter_mutex);
-        delete data_seq[i].a;
+        // 释放内存
+        delete[] data_seq[i].a;
         data_seq[i].a = nullptr;
 
-        delete data_seq[i].MD5;
+        delete[] data_seq[i].MD5;
         data_seq[i].MD5 = nullptr;
+
         ++received_packets; // 接收到的数据包数量
         sent_packets = received_sent_packets; // 更新发送的数据包数量
         ++throughput_counter;
+
+        // 发送回复信号
+        std::lock_guard<std::mutex> reply_lock(reply_mutex);
+        reply_received_condition.notify_all();
+
 
         // 将数据放入队列
        /* {
@@ -195,10 +153,16 @@ static int subscriber_shutdown(
 extern "C" int subscriber_main(int domainId, int sample_count, int data_size)
 {
 	DomainParticipant *participant = nullptr;
+    Publisher *publisher = NULL;
 	Subscriber *subscriber = nullptr;
-	Topic *topic = nullptr;
+    Topic* publish_topic = NULL;
+    Topic* subscribe_topic = NULL;
 	UserDataTypeListener *reader_listener = nullptr;
 	DataReader *reader = nullptr;
+    DataWriter *writer = NULL;
+    UserDataType *instance = NULL;
+    InstanceHandle_t instance_handle = HANDLE_NIL;
+    UserDataTypeDataWriter * UserDataType_writer = NULL;
 	ReturnCode_t retcode;
 	const char *type_name = nullptr;
 	int count = 0;
@@ -228,6 +192,15 @@ extern "C" int subscriber_main(int domainId, int sample_count, int data_size)
 		return -1;
 	}
 
+    publisher = participant->create_publisher(
+            PUBLISHER_QOS_DEFAULT /* 默认QoS */,
+            NULL /* listener */, STATUS_MASK_NONE);
+    if (publisher == NULL) {
+        fprintf(stderr, "create_publisher error\n");
+        subscriber_shutdown(participant);
+        return -1;
+    }
+
 	/* 3. 在创建主题之前注册数据类型 */
 	/* 建议1：在程序启动后优先进行注册 */
 	/* 建议2：一个数据类型注册一次即可 */
@@ -243,31 +216,53 @@ extern "C" int subscriber_main(int domainId, int sample_count, int data_size)
 	/* 4. 创建主题，并定制主题的QoS  */
 	/* 建议1：在程序启动后优先创建Topic */
 	/* 建议2：一种主题名创建一次即可，无需重复创建 */
-	topic = participant->create_topic(
+    subscribe_topic = participant->create_topic(
 		"Topic_A"/* 主题名，应与发布者主题名一致 */,
 		type_name, TOPIC_QOS_DEFAULT/* 默认QoS */,
         nullptr /* listener */, STATUS_MASK_NONE);
-	if (topic == nullptr) {
+	if (subscribe_topic == nullptr) {
 		fprintf(stderr, "create_topic error\n");
 		subscriber_shutdown(participant);
 		return -1;
 	}
 
+    publish_topic = participant->create_topic(
+            "topic_B" /* 订阅主题名 */,
+            type_name /* 类型名 */, TOPIC_QOS_DEFAULT /* 默认QoS */,
+            NULL /* listener */, STATUS_MASK_NONE);
+    if (publish_topic == NULL) {
+        fprintf(stderr, "create_topic for subscribe error\n");
+        subscriber_shutdown(participant);
+        return -1;
+    }
+
 	/* 5. 创建一个监听器 */
 	reader_listener = new UserDataTypeListener();
 
     /* 6. 创建datareader，并定制datareader的QoS */
-    /* 建议1：在程序启动后优先创建datareader*/
-    /* 建议2：创建一次即可，无需重复创建 */
-    /* 建议3：在程序退出时再进行释放 */
-    /* 建议4：避免打算接收数据时创建datareader，接收数据后删除，该做法消耗资源，影响性能 */
+
     reader = subscriber->create_datareader(
-            topic, DATAREADER_QOS_DEFAULT/* 默认QoS */,
+            subscribe_topic, DATAREADER_QOS_DEFAULT/* 默认QoS */,
             reader_listener/* listener */, STATUS_MASK_ALL);
     if (reader == nullptr) {
         fprintf(stderr, "create_datareader error\n");
         subscriber_shutdown(participant);
         delete reader_listener;
+        return -1;
+    }
+
+    writer = publisher->create_datawriter(
+            publish_topic , DATAWRITER_QOS_DEFAULT/* 默认QoS */,
+            NULL /* listener */, STATUS_MASK_NONE);
+    if (writer == NULL) {
+        fprintf(stderr, "create_datawriter error\n");
+        subscriber_shutdown(participant);
+        return -1;
+    }
+    UserDataType_writer = UserDataTypeDataWriter::narrow(writer);
+    if (UserDataType_writer == NULL) {
+        fprintf(stderr, "DataWriter narrow error\n");
+        subscriber_shutdown(participant);
         return -1;
     }
 
@@ -278,9 +273,36 @@ extern "C" int subscriber_main(int domainId, int sample_count, int data_size)
         processing_threads.emplace_back(dataProcessingThread);
     }
 
+     /* 6. 创建一个数据样本 */
+    /* 建议：该数据为new出来的，使用后用户需要调用delete_data进行释放内存*/
+    instance = UserDataTypeTypeSupport::create_data();
+    if (instance == NULL) {
+        fprintf(stderr, "UserDataTypeTypeSupport::create_data error\n");
+        subscriber_shutdown(participant);
+        return -1;
+    }
+    char data_put = 1;
     /* 7. 主循环 ，监听器会默认调用on_data_available()监听数据 */
 	for (count = 0; (sample_count == 0) || (count < sample_count); ++count) {
-		//保持进程一直运行
+        // 等待回复
+        std::unique_lock<std::mutex> reply_lock(reply_mutex);
+        reply_received_condition.wait(reply_lock);
+
+        instance->a = new char[data_size];
+        memset(instance->a, data_put, data_size);
+        instance->MD5 = new char[33];
+
+        std::string md5 = calculate_MD5(std::string(instance->a, data_size));
+        strcpy(instance->MD5, md5.c_str());
+        ++sent_packets;
+        instance->sent_packets = sent_packets;
+
+        // 发送数据
+        retcode = UserDataType_writer->write(*instance, instance_handle);
+        if (retcode != RETCODE_OK) {
+            fprintf(stderr, "write error %d\n", retcode);
+        }   else {std::cout << "发送成功" <<std::endl;}
+
 	}
 
     // 等待所有任务完成
@@ -291,6 +313,13 @@ extern "C" int subscriber_main(int domainId, int sample_count, int data_size)
     /*for (auto& thread : processing_threads) {
         thread.join();
     }
+
+     /*  删除数据样本 */
+    retcode = UserDataTypeTypeSupport::delete_data(instance);
+    if (retcode != RETCODE_OK) {
+        fprintf(stderr, "UserDataTypeTypeSupport::delete_data error %d\n", retcode);
+    }
+
 	/* 8. 删除所有实体和监听器 */
 	status = subscriber_shutdown(participant);
 	delete reader_listener;
